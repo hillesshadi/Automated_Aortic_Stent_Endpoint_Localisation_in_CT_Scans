@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+"""
+stent_ring_detector.py  (v2 — nnU-Net + 3D Cylindrical Tracking)
+=================================================================
+Pipeline:
+  1. DICOM Loading
+  2. Deep-Learning Aorta Segmentation (TotalSegmentator / nnU-Net / fallback)
+  3. Aorta ROI Extraction (per-slice centroid + bounding region)
+  4. Adaptive High-HU Candidate Extraction
+  5. Contour + Radial Ring Detection (per-slice)
+  6. 3D Cylindrical Consistency Tracking
+  7. Slice Classification
+  8. Gap Bridging & Temporal Smoothing
+  9. Start / End / Midpoint Localization
+ 10. World Coordinate Measurement + Excel Report
+
+Usage
+-----
+  python stent_ring_detector.py --data_root /path/to/Data_Root --output results.xlsx
+  sbatch run_stent_ring.sh
+"""
+
+import os, re, sys, gc, logging, argparse, threading, traceback, tempfile, subprocess, shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
+
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sys.exit("ERROR: pip install SimpleITK")
+try:
+    import pydicom
+except ImportError:
+    sys.exit("ERROR: pip install pydicom")
+try:
+    from scipy.ndimage import (
+        binary_closing, binary_dilation, binary_fill_holes,
+        distance_transform_edt, label as ndi_label, gaussian_filter1d,
+        median_filter as ndi_median_filter,
+    )
+    from scipy.spatial import cKDTree
+except ImportError:
+    sys.exit("ERROR: pip install scipy")
+try:
+    from skimage.measure import find_contours, label as sk_label, regionprops
+    from skimage.morphology import skeletonize
+except ImportError:
+    sys.exit("ERROR: pip install scikit-image")
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    sys.exit("ERROR: pip install openpyxl")
+try:
+    import pandas as pd
+except ImportError:
+    sys.exit("ERROR: pip install pandas")
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+# Check for TotalSegmentator
+HAS_TOTALSEG = shutil.which("TotalSegmentator") is not None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+HU_LUMEN_MIN, HU_LUMEN_MAX = 100, 500
+HU_STENT_ADAPTIVE_FLOOR = 400       # minimum HU for stent candidate
+HU_STENT_MAX = 3071
+DILATION_MM = 10.0
+MIN_RING_SCORE = 0.30
+MIN_CONTOUR_PTS = 12
+MIN_STENT_SLICES = 5
+GAP_BRIDGE = 4
+CYLINDER_WINDOW = 5                 # slices for 3D cylindrical consistency
+CYLINDER_RADIUS_TOL_MM = 8.0        # center drift tolerance across slices
+CYLINDER_DIAM_TOL_FRAC = 0.35       # diameter change tolerance (fraction)
+N_RADIAL_ANGLES = 36
+AORTA_DIAM_MIN_MM, AORTA_DIAM_MAX_MM = 15.0, 45.0
+
+FOLDER_RE = re.compile(r'^(.+?)-(\d+)$')
+EXCEL_HEADERS = [
+    "Case ID", "CT Date",
+    "Start X (mm)", "Start Y (mm)", "Start Z (mm)",
+    "End X (mm)", "End Y (mm)", "End Z (mm)",
+    "Mid X (mm)", "Mid Y (mm)", "Mid Z (mm)",
+    "Stent Length (mm)", "Slices Detected", "Mean Ring Score",
+    "Seg Method", "Start Err (mm)", "End Err (mm)", "Status",
+]
+_xlsx_lock = threading.Lock()
+
+def _make_logger(name="stent_ring_v2"):
+    log = logging.getLogger(name)
+    if not log.handlers:
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+        log.addHandler(h)
+    log.setLevel(logging.INFO)
+    return log
+
+logger = _make_logger()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — DICOM Loading
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_dicom(dicom_dir: str):
+    """Load DICOM → (volume_hu[Z,Y,X], spacing, origin, ct_date, z_phys)."""
+    logger.info("  [1-load] %s", dicom_dir)
+    ct_date = "N/A"
+    for fname in sorted(os.listdir(dicom_dir)):
+        fp = os.path.join(dicom_dir, fname)
+        if not os.path.isfile(fp):
+            continue
+        try:
+            ds = pydicom.dcmread(fp, stop_before_pixels=True)
+            for tag in ("AcquisitionDate", "StudyDate", "SeriesDate"):
+                raw = getattr(ds, tag, None)
+                if raw and len(str(raw)) == 8:
+                    ct_date = f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+                    break
+            break
+        except Exception:
+            continue
+
+    reader = sitk.ImageSeriesReader()
+    files = reader.GetGDCMSeriesFileNames(dicom_dir)
+    if not files:
+        raise FileNotFoundError(f"No DICOM series in: {dicom_dir}")
+    reader.SetFileNames(files)
+    img = reader.Execute()
+    spacing = img.GetSpacing()
+    origin = img.GetOrigin()
+    vol = sitk.GetArrayFromImage(img).astype(np.int16)
+    z_phys = np.array([origin[2] + i * spacing[2] for i in range(vol.shape[0])])
+    logger.info("  [1-load] shape=%s spacing=(%.2f,%.2f,%.2f) Z=[%.1f,%.1f]",
+                vol.shape, *spacing, z_phys.min(), z_phys.max())
+    return vol, spacing, origin, ct_date, z_phys, img
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — Deep Learning Aorta Segmentation
+# ═══════════════════════════════════════════════════════════════════════════════
+def _ball(r):
+    g = np.mgrid[-r:r+1, -r:r+1, -r:r+1]
+    return (g[0]**2 + g[1]**2 + g[2]**2) <= r**2
+
+def segment_aorta_totalseg(sitk_img, dicom_dir):
+    """Use TotalSegmentator (nnU-Net) for aorta segmentation."""
+    logger.info("  [2-seg] Using TotalSegmentator (nnU-Net) ...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        nii_in = os.path.join(tmpdir, "input.nii.gz")
+        out_dir = os.path.join(tmpdir, "segmentations")
+        sitk.WriteImage(sitk_img, nii_in)
+
+        cmd = ["TotalSegmentator", "-i", nii_in, "-o", out_dir, "--fast",
+               "--roi_subset", "aorta"]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning("  [2-seg] TotalSegmentator failed: %s", e)
+            return None
+
+        # Look for aorta segmentation file
+        for name in ["aorta.nii.gz", "aorta_ascending.nii.gz"]:
+            seg_path = os.path.join(out_dir, name)
+            if os.path.exists(seg_path):
+                seg_img = sitk.ReadImage(seg_path)
+                mask = sitk.GetArrayFromImage(seg_img).astype(bool)
+                logger.info("  [2-seg] TotalSegmentator: %d aorta voxels", int(mask.sum()))
+                return mask
+
+        # If roi_subset didn't work, try combined output
+        combined = os.path.join(out_dir, "total.nii.gz")
+        if os.path.exists(combined):
+            seg_img = sitk.ReadImage(combined)
+            arr = sitk.GetArrayFromImage(seg_img)
+            # Aorta label IDs in TotalSegmentator: 7 (asc), 8 (desc)
+            mask = np.isin(arr, [7, 8])
+            if mask.any():
+                logger.info("  [2-seg] TotalSegmentator combined: %d aorta voxels", int(mask.sum()))
+                return mask
+
+    return None
+
+def segment_aorta_threshold(volume_hu, spacing):
+    """Fallback: multi-threshold + morphology aorta segmentation."""
+    logger.info("  [2-seg] Fallback: multi-threshold segmentation ...")
+    best_mask, best_score = None, -1e9
+    sz_min = min(spacing)
+
+    for hu_lo, hu_hi in [(80, 450), (100, 500), (150, 600), (50, 400)]:
+        mask = (volume_hu.astype(np.int32) >= hu_lo) & (volume_hu.astype(np.int32) <= hu_hi)
+        cr = max(1, min(3, int(round(4.0 / sz_min))))
+        mask = binary_closing(mask, structure=_ball(cr))
+        for z in range(mask.shape[0]):
+            mask[z] = binary_fill_holes(mask[z])
+        labeled, n = ndi_label(mask)
+        if n == 0:
+            continue
+        sizes = np.array([(labeled == i).sum() for i in range(1, n + 1)])
+        cc = (labeled == int(np.argmax(sizes)) + 1)
+        z_ext = sum(1 for zz in range(cc.shape[0]) if cc[zz].any())
+        body_frac = int(cc.sum()) / max(1, mask.size)
+        score = z_ext * 1000 - abs(body_frac - 0.005) * 1e8
+        if score > best_score:
+            best_score = score
+            best_mask = cc.astype(bool)
+
+    if best_mask is not None:
+        logger.info("  [2-seg] Fallback: %d aorta voxels", int(best_mask.sum()))
+    return best_mask
+
+def segment_aorta(volume_hu, spacing, sitk_img, dicom_dir):
+    """Try nnU-Net/TotalSegmentator first, fall back to threshold."""
+    seg_method = "threshold"
+    mask = None
+
+    if HAS_TOTALSEG:
+        mask = segment_aorta_totalseg(sitk_img, dicom_dir)
+        if mask is not None:
+            seg_method = "TotalSegmentator"
+
+    if mask is None:
+        mask = segment_aorta_threshold(volume_hu, spacing)
+        seg_method = "threshold"
+
+    if mask is None or not mask.any():
+        logger.warning("  [2-seg] Aorta segmentation failed entirely")
+        return np.zeros(volume_hu.shape, dtype=bool), "FAILED"
+
+    return mask, seg_method
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Aorta ROI Extraction (per-slice centroid + radius)
+# ═══════════════════════════════════════════════════════════════════════════════
+def extract_aorta_roi(lumen_mask, spacing):
+    """Per-slice centroid (cy, cx) and radius_mm. Returns dict {z: (cy,cx,r_mm)}."""
+    sx, sy = spacing[0], spacing[1]
+    rois = {}
+    for z in range(lumen_mask.shape[0]):
+        sl = lumen_mask[z]
+        if not sl.any():
+            continue
+        ys, xs = np.where(sl)
+        cy, cx = float(ys.mean()), float(xs.mean())
+        area_mm2 = float(sl.sum()) * sx * sy
+        r_mm = float(np.sqrt(area_mm2 / np.pi))
+        rois[z] = (cy, cx, r_mm)
+    logger.info("  [3-roi] Aorta present in %d slices", len(rois))
+    return rois
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — Adaptive High-HU Candidate Extraction
+# ═══════════════════════════════════════════════════════════════════════════════
+def extract_candidates(volume_hu, lumen_mask, rois, spacing):
+    """Per-slice high-HU binary within dilated aorta ROI. Returns {z: mask2d}."""
+    sx, sy = spacing[0], spacing[1]
+    dil_r = max(2, int(round(DILATION_MM / min(sx, sy))))
+    struct_2d = np.ones((2*dil_r+1, 2*dil_r+1), dtype=bool)
+    candidates = {}
+
+    for z, (cy, cx, r_mm) in rois.items():
+        sl_hu = volume_hu[z].astype(np.int32)
+        search = binary_dilation(lumen_mask[z], structure=struct_2d)
+        roi_vals = sl_hu[search]
+        if len(roi_vals) == 0:
+            continue
+        p90 = float(np.percentile(roi_vals, 90))
+        hu_min = max(HU_STENT_ADAPTIVE_FLOOR, int(p90 * 0.85))
+        high = (sl_hu >= hu_min) & (sl_hu <= HU_STENT_MAX) & search
+        if int(high.sum()) >= 8:
+            candidates[z] = high.astype(np.uint8)
+        else:
+            # Try lower threshold
+            med = (sl_hu >= max(350, int(p90 * 0.7))) & (sl_hu <= HU_STENT_MAX) & search
+            if int(med.sum()) >= 8:
+                candidates[z] = med.astype(np.uint8)
+
+    logger.info("  [4-cand] Candidate slices: %d / %d", len(candidates), len(rois))
+    return candidates
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — Contour + Radial Ring Detection
+# ═══════════════════════════════════════════════════════════════════════════════
+def _fit_ellipse(pts_xy):
+    """Fit ellipse. Returns ((cx,cy),(w,h),angle) or None."""
+    if len(pts_xy) < 5:
+        return None
+    if HAS_CV2:
+        try:
+            return cv2.fitEllipse(pts_xy.astype(np.float32).reshape(-1, 1, 2))
+        except Exception:
+            pass
+    try:
+        from skimage.measure import EllipseModel
+        model = EllipseModel()
+        if model.estimate(pts_xy):
+            xc, yc, a, b, theta = model.params
+            return ((xc, yc), (2*a, 2*b), np.degrees(theta))
+    except Exception:
+        pass
+    return None
+
+def detect_ring_contour(cand_mask, cy_a, cx_a, r_mm, spacing):
+    """Find ring contours via ellipse fitting. Returns list of ring dicts."""
+    sx, sy = spacing[0], spacing[1]
+    rings = []
+    for contour in find_contours(cand_mask, level=0.5):
+        if len(contour) < MIN_CONTOUR_PTS:
+            continue
+        pts_xy = contour[:, ::-1]
+        ell = _fit_ellipse(pts_xy)
+        if ell is None:
+            continue
+        (ecx, ecy), (ew, eh), _ = ell
+        if ew < 1 or eh < 1:
+            continue
+        ew_mm, eh_mm = ew * sx, eh * sy
+        mean_d = (ew_mm + eh_mm) / 2.0
+        area = np.pi * (ew/2) * (eh/2)
+        perim = np.pi * (3*(ew/2+eh/2) - np.sqrt((3*ew/2+eh/2)*(ew/2+3*eh/2)))
+        circ = min((4*np.pi*area) / max(perim**2, 1), 1.0)
+        ax_r = max(ew, eh) / max(min(ew, eh), 1)
+        dist = np.sqrt((ecx - cx_a)**2 + (ecy - cy_a)**2) * min(sx, sy)
+        closed = np.linalg.norm(contour[0] - contour[-1]) < max(5, len(contour)*0.1)
+        rings.append({
+            "cx": ecx, "cy": ecy, "diam_mm": mean_d,
+            "circ": circ, "ax_ratio": ax_r, "dist_mm": dist,
+            "closed": closed, "npts": len(contour),
+            "w_mm": ew_mm, "h_mm": eh_mm,
+        })
+    return rings
+
+def detect_ring_radial(cand_mask, cy_a, cx_a, spacing):
+    """Radial profile completeness. Returns 0.0–1.0."""
+    sx, sy = spacing[0], spacing[1]
+    H, W = cand_mask.shape
+    r_min = max(3, int(AORTA_DIAM_MIN_MM / 2 / min(sx, sy)))
+    r_max = int(AORTA_DIAM_MAX_MM / 2 / min(sx, sy)) + 10
+    angles = np.linspace(0, 2*np.pi, N_RADIAL_ANGLES, endpoint=False)
+    peaks = []
+    for a in angles:
+        for r in range(r_min, min(r_max, max(H, W)//2)):
+            y, x = int(round(cy_a + r*np.sin(a))), int(round(cx_a + r*np.cos(a)))
+            if 0 <= y < H and 0 <= x < W and cand_mask[y, x] > 0:
+                peaks.append(r)
+                break
+    if len(peaks) < 3:
+        return 0.0
+    med = np.median(peaks)
+    tol = max(3, med * 0.3)
+    return float(np.sum(np.abs(np.array(peaks) - med) <= tol)) / N_RADIAL_ANGLES
+
+def score_slice(rings, radial, cy_a, cx_a, r_mm):
+    """Composite ring score. Returns (score, best_ring)."""
+    best_s, best_r = 0.0, None
+    for rng in rings:
+        s_c = min(rng["circ"] / 0.5, 1.0)
+        s_a = max(0, 1 - abs(rng["ax_ratio"] - 1) / 2)
+        s_d = max(0, 1 - rng["dist_mm"] / 20)
+        s_sz = 1.0 if AORTA_DIAM_MIN_MM <= rng["diam_mm"] <= AORTA_DIAM_MAX_MM else max(0, 0.5)
+        s_cl = 1.0 if rng["closed"] else 0.4
+        s_n = min(rng["npts"] / 40, 1.0)
+        s = 0.20*s_c + 0.15*s_a + 0.20*s_d + 0.15*s_sz + 0.15*s_cl + 0.15*s_n
+        if s > best_s:
+            best_s, best_r = s, rng
+    return 0.55 * best_s + 0.45 * radial, best_r
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — 3D Cylindrical Consistency Tracking
+# ═══════════════════════════════════════════════════════════════════════════════
+def cylindrical_consistency(
+    scores_raw, ring_info, rois, spacing, window=CYLINDER_WINDOW
+):
+    """
+    Enforce 3D consistency: a true stent forms a cylinder — consecutive slices
+    should have rings at similar (cx, cy) positions and similar diameters.
+    Penalize isolated detections that break the cylinder assumption.
+    """
+    nz = len(scores_raw)
+    scores_out = scores_raw.copy()
+    sz = spacing[2]
+    sxy = min(spacing[0], spacing[1])
+
+    # Collect ring centers and diameters
+    centers = {}  # z -> (cx_mm, cy_mm, diam_mm)
+    for z in range(nz):
+        rng = ring_info.get(z)
+        if rng is not None and "cx" in rng:
+            centers[z] = (rng["cx"] * sxy, rng["cy"] * sxy, rng["diam_mm"])
+        elif z in rois:
+            cy, cx, r_mm = rois[z]
+            centers[z] = (cx * sxy, cy * sxy, 2 * r_mm)
+
+    # For each slice with a detection, check neighbours
+    for z in range(nz):
+        if scores_raw[z] < 0.1:
+            continue
+        if z not in centers:
+            continue
+
+        cx_z, cy_z, d_z = centers[z]
+        consistent_count = 0
+        check_count = 0
+
+        for dz in range(-window, window + 1):
+            zn = z + dz
+            if dz == 0 or zn < 0 or zn >= nz or zn not in centers:
+                continue
+            check_count += 1
+            cx_n, cy_n, d_n = centers[zn]
+
+            # Check center drift
+            drift = np.sqrt((cx_z - cx_n)**2 + (cy_z - cy_n)**2)
+            # Check diameter consistency
+            diam_diff = abs(d_z - d_n) / max(d_z, d_n, 1)
+
+            if drift < CYLINDER_RADIUS_TOL_MM and diam_diff < CYLINDER_DIAM_TOL_FRAC:
+                consistent_count += 1
+
+        if check_count > 0:
+            consistency = float(consistent_count) / float(check_count)
+            # Boost scores with high cylindrical consistency, penalize outliers
+            scores_out[z] *= (0.4 + 0.6 * consistency)
+
+    logger.info("  [6-cyl] 3D cylindrical consistency applied (window=%d)", window)
+    return scores_out
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 7 — Slice Classification
+# ═══════════════════════════════════════════════════════════════════════════════
+def classify_slices(volume_hu, rois, candidates, spacing):
+    """Per-slice ring detection + scoring. Returns (scores, classified, ring_info)."""
+    nz = volume_hu.shape[0]
+    scores = np.zeros(nz)
+    ring_info = {}
+    for z in range(nz):
+        if z not in rois or z not in candidates:
+            ring_info[z] = None
+            continue
+        cy, cx, r_mm = rois[z]
+        rings = detect_ring_contour(candidates[z], cy, cx, r_mm, spacing)
+        radial = detect_ring_radial(candidates[z], cy, cx, spacing)
+        sc, best = score_slice(rings, radial, cy, cx, r_mm)
+        scores[z] = sc
+        ring_info[z] = best
+    return scores, ring_info
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 8 — Gap Bridging & Temporal Smoothing
+# ═══════════════════════════════════════════════════════════════════════════════
+def smooth_and_bridge(scores, gap=GAP_BRIDGE):
+    """Median filter + Gaussian smooth + gap bridging."""
+    nz = len(scores)
+    if nz > 5:
+        # Median filter to remove isolated spikes/drops
+        s = ndi_median_filter(scores, size=5)
+        # Light Gaussian smoothing along Z
+        s = gaussian_filter1d(s, sigma=1.5)
+    else:
+        s = scores.copy()
+
+    classified = (s >= MIN_RING_SCORE).astype(np.int32)
+
+    # Bridge small gaps
+    bridged = classified.copy()
+    for i in range(nz):
+        if bridged[i] == 0:
+            left = max(0, i - gap)
+            right = min(nz, i + gap + 1)
+            has_l = np.any(classified[left:i] > 0) if i > 0 else False
+            has_r = np.any(classified[i+1:right] > 0) if i < nz - 1 else False
+            if has_l and has_r:
+                bridged[i] = 1
+
+    n_det = int(bridged.sum())
+    logger.info("  [8-smooth] Stent slices after smoothing+bridging: %d / %d", n_det, nz)
+    return s, bridged
+
+def find_stent_region(classified):
+    """Find longest contiguous stent run. Returns (start_z, end_z) or None."""
+    nz = len(classified)
+    runs, in_run, start = [], False, 0
+    for i in range(nz):
+        if classified[i] > 0 and not in_run:
+            start, in_run = i, True
+        elif classified[i] == 0 and in_run:
+            runs.append((start, i - 1))
+            in_run = False
+    if in_run:
+        runs.append((start, nz - 1))
+    if not runs:
+        return None
+    runs.sort(key=lambda r: r[1] - r[0], reverse=True)
+    best = runs[0]
+    if best[1] - best[0] + 1 < MIN_STENT_SLICES:
+        logger.warning("  [8-region] Run too short: %d < %d", best[1]-best[0]+1, MIN_STENT_SLICES)
+        return None
+    logger.info("  [8-region] Stent: slices %d–%d (%d)", best[0], best[1], best[1]-best[0]+1)
+    return best
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 9+10 — Start/End/Midpoint + World Coordinates
+# ═══════════════════════════════════════════════════════════════════════════════
+def compute_world_endpoints(start_z, end_z, rois, ring_info, spacing, origin, z_phys):
+    """Convert slice endpoints to world-mm coordinates."""
+    sx, sy = spacing[0], spacing[1]
+    ox, oy = origin[0], origin[1]
+
+    def _xy_mm(z_sl):
+        rng = ring_info.get(z_sl)
+        if rng and "cx" in rng:
+            return ox + rng["cx"] * sx, oy + rng["cy"] * sy
+        if z_sl in rois:
+            cy, cx, _ = rois[z_sl]
+            return ox + cx * sx, oy + cy * sy
+        for dz in range(1, 10):
+            for zz in [z_sl - dz, z_sl + dz]:
+                if zz in rois:
+                    cy, cx, _ = rois[zz]
+                    return ox + cx * sx, oy + cy * sy
+        return ox, oy
+
+    xs, ys = _xy_mm(start_z)
+    xe, ye = _xy_mm(end_z)
+    mid_z = (start_z + end_z) // 2
+    xm, ym = _xy_mm(mid_z)
+
+    start_mm = np.array([xs, ys, float(z_phys[start_z])])
+    end_mm   = np.array([xe, ye, float(z_phys[end_z])])
+    mid_mm   = np.array([xm, ym, float(z_phys[mid_z])])
+
+    # Enforce orientation: start = cranial (highest Z)
+    if start_mm[2] < end_mm[2]:
+        start_mm, end_mm = end_mm.copy(), start_mm.copy()
+
+    length = float(np.linalg.norm(end_mm - start_mm))
+    return start_mm, end_mm, mid_mm, length
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Excel Output
+# ═══════════════════════════════════════════════════════════════════════════════
+def save_to_excel(result, xlsx_path):
+    with _xlsx_lock:
+        if os.path.exists(xlsx_path):
+            wb = openpyxl.load_workbook(xlsx_path)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Stent Ring Detection v2"
+            hf = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+            hfl = PatternFill("solid", fgColor="1F4E79")
+            ha = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for col, h in enumerate(EXCEL_HEADERS, 1):
+                c = ws.cell(row=1, column=col, value=h)
+                c.font, c.fill, c.alignment = hf, hfl, ha
+                ws.column_dimensions[get_column_letter(col)].width = 16
+            ws.freeze_panes = "A2"
+
+        ri = ws.max_row + 1
+        data = [
+            result.get("case_id",""), result.get("ct_date","N/A"),
+            result.get("start_x"), result.get("start_y"), result.get("start_z"),
+            result.get("end_x"), result.get("end_y"), result.get("end_z"),
+            result.get("mid_x"), result.get("mid_y"), result.get("mid_z"),
+            result.get("length_mm"), result.get("slices_detected"),
+            result.get("mean_ring_score"), result.get("seg_method"),
+            result.get("start_err"), result.get("end_err"), result.get("status",""),
+        ]
+        fill = PatternFill("solid", fgColor="D6E4F0" if ri % 2 == 0 else "FFFFFF")
+        ac = Alignment(horizontal="center", vertical="center")
+        for col, val in enumerate(data, 1):
+            c = ws.cell(row=ri, column=col, value=val)
+            c.fill, c.alignment = fill, ac
+            if isinstance(val, float):
+                c.number_format = "0.00"
+        sc = ws.cell(row=ri, column=len(EXCEL_HEADERS))
+        sv = str(result.get("status",""))
+        if "ERROR" in sv.upper():
+            sc.font = Font(color="FF0000", bold=True)
+        elif "WARN" in sv.upper():
+            sc.font = Font(color="FF8C00", bold=True)
+        else:
+            sc.font = Font(color="006400", bold=True)
+        wb.save(xlsx_path)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-patient pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+def _empty(cid, ct="N/A"):
+    return {k: None for k in ["start_x","start_y","start_z","end_x","end_y","end_z",
+            "mid_x","mid_y","mid_z","length_mm","slices_detected","mean_ring_score",
+            "start_err","end_err"]} | {"case_id":cid,"ct_date":ct,"seg_method":"","status":"ERROR"}
+
+def process_patient(args_tuple):
+    case_id, dicom_dir, xlsx_path, annot = args_tuple
+    result = _empty(case_id)
+    try:
+        logger.info("\n━━━ %s ━━━", case_id)
+
+        # Step 1
+        vol, spacing, origin, ct_date, z_phys, sitk_img = load_dicom(dicom_dir)
+        result["ct_date"] = ct_date
+
+        # Step 2
+        lumen, seg_method = segment_aorta(vol, spacing, sitk_img, dicom_dir)
+        result["seg_method"] = seg_method
+        del sitk_img
+        if not lumen.any():
+            result["status"] = "WARN: aorta empty"
+            save_to_excel(result, xlsx_path); return result
+
+        # Step 3
+        rois = extract_aorta_roi(lumen, spacing)
+        if len(rois) < 10:
+            result["status"] = "WARN: too few aorta slices"
+            save_to_excel(result, xlsx_path); return result
+
+        # Step 4
+        candidates = extract_candidates(vol, lumen, rois, spacing)
+        del lumen; gc.collect()
+        if len(candidates) < MIN_STENT_SLICES:
+            result["status"] = "WARN: too few candidates"
+            save_to_excel(result, xlsx_path); return result
+
+        # Step 5+7 — per-slice ring detection + classification
+        scores_raw, ring_info = classify_slices(vol, rois, candidates, spacing)
+        del vol; gc.collect()
+
+        # Step 6 — 3D cylindrical consistency
+        scores_cyl = cylindrical_consistency(scores_raw, ring_info, rois, spacing)
+
+        # Step 8 — gap bridging & smoothing
+        scores_smooth, classified = smooth_and_bridge(scores_cyl)
+
+        region = find_stent_region(classified)
+        if region is None:
+            result["status"] = "WARN: no stent region"
+            save_to_excel(result, xlsx_path); return result
+
+        start_z, end_z = region
+
+        # Steps 9+10 — world coordinates
+        start_mm, end_mm, mid_mm, length = compute_world_endpoints(
+            start_z, end_z, rois, ring_info, spacing, origin, z_phys)
+
+        n_det = int(classified[start_z:end_z+1].sum())
+        stent_scores = scores_smooth[start_z:end_z+1]
+        mean_sc = float(np.mean(stent_scores)) if len(stent_scores) > 0 else 0
+
+        result.update({
+            "start_x": round(float(start_mm[0]),3), "start_y": round(float(start_mm[1]),3),
+            "start_z": round(float(start_mm[2]),3),
+            "end_x": round(float(end_mm[0]),3), "end_y": round(float(end_mm[1]),3),
+            "end_z": round(float(end_mm[2]),3),
+            "mid_x": round(float(mid_mm[0]),3), "mid_y": round(float(mid_mm[1]),3),
+            "mid_z": round(float(mid_mm[2]),3),
+            "length_mm": round(length,2), "slices_detected": n_det,
+            "mean_ring_score": round(mean_sc,3), "status": "OK",
+        })
+
+        # Validation
+        if annot:
+            try:
+                ms = np.array(annot["start"], dtype=float)
+                me = np.array(annot["end"], dtype=float)
+                if ms[2] < me[2]: ms, me = me, ms
+                result["start_err"] = round(float(np.linalg.norm(start_mm - ms)), 2)
+                result["end_err"]   = round(float(np.linalg.norm(end_mm   - me)), 2)
+                logger.info("  [eval] err: start=%.2f end=%.2f mm",
+                           result["start_err"], result["end_err"])
+            except Exception as e:
+                logger.warning("  [eval] %s", e)
+
+        logger.info("  [done] %s len=%.1f slices=%d score=%.3f seg=%s",
+                    case_id, length, n_det, mean_sc, seg_method)
+
+    except Exception:
+        result["status"] = f"ERROR: {traceback.format_exc(limit=3)}"
+        logger.error("  [FAIL] %s\n%s", case_id, traceback.format_exc())
+
+    save_to_excel(result, xlsx_path)
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Batch
+# ═══════════════════════════════════════════════════════════════════════════════
+def discover_datasets(data_root):
+    datasets = []
+    root = Path(data_root)
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir(): continue
+        if FOLDER_RE.match(entry.name):
+            datasets.append((entry.name, str(entry))); continue
+        for sub in sorted(entry.iterdir()):
+            if sub.is_dir():
+                datasets.append((f"{entry.name}-{sub.name}", str(sub)))
+    if not datasets:
+        raise FileNotFoundError(f"No datasets under {data_root}")
+    logger.info("  Discovered %d datasets", len(datasets))
+    return datasets
+
+def _load_annotations(path):
+    if not path or not os.path.exists(path): return {}
+    try:
+        df = pd.read_csv(path)
+        df.columns = [c.lower().strip() for c in df.columns]
+        return {str(r.get("case_id","")).strip(): {
+            "start":[float(r["start_x"]),float(r["start_y"]),float(r["start_z"])],
+            "end":[float(r["end_x"]),float(r["end_y"]),float(r["end_z"])]}
+            for _,r in df.iterrows() if str(r.get("case_id","")).strip()}
+    except Exception:
+        return {}
+
+BUILTIN_ANNOTATIONS = {
+    "5119278-1":{"start":[40.261,161.179,718.67],"end":[48.978,224.1,649.92]},
+    "5119278-2":{"start":[29.657,154.777,604.04],"end":[58.209,216.172,540.29]},
+    "5162212-1":{"start":[77.754,138.892,608.18],"end":[118.782,205.311,523.58]},
+    "5162212-2":{"start":[33.659,148.119,639.88],"end":[54.336,220.374,566.18]},
+    "5165800-1":{"start":[8.694,115.127,587.95],"end":[48.544,198.456,548.95]},
+    "5165800-2":{"start":[11.405,138.185,562.99],"end":[63.324,216.477,521.74]},
+    "5735803-1":{"start":[13.671,168.675,572.35],"end":[18.6,232.9,509.1]},
+    "5735803-2":{"start":[11.648,157.49,495.44],"end":[6.819,224.905,429.99]},
+    "5740808-1":{"start":[32.441,150.524,610.94],"end":[27.112,205.718,548.84]},
+    "5740808-2":{"start":[21.909,-27.383,-26.52],"end":[23.037,45.179,-75.798]},
+    "5754787-1":{"start":[-5.777,143.214,663.27],"end":[-4.391,212.905,595.07]},
+    "5754787-2":{"start":[9.356,128.66,608.79],"end":[16.979,205.504,550.29]},
+    "5922241-1":{"start":[-3.953,149.619,-273.73],"end":[20.482,192.786,-344.23]},
+    "5922241-2":{"start":[6.76,147.788,-421.38],"end":[29.062,204.761,-490.38]},
+    "6052797-1":{"start":[-12.17,134.427,827.07],"end":[21.037,216.641,767.82]},
+    "6052797-2":{"start":[10.448,129.644,728.01],"end":[52.847,216.218,678.51]},
+    "6425195-1":{"start":[16.832,160.776,856.98],"end":[16.436,205.681,762.38]},
+    "6425195-2":{"start":[33.243,-10.4,1864.1],"end":[23.042,47.29,1780.1]},
+    "6451685-1":{"start":[50.423,136.345,-87.29],"end":[56.765,190.741,-146.69]},
+    "6451685-2":{"start":[46.477,-43.108,-69.375],"end":[51.417,19.987,-125.625]},
+    "6522330-1":{"start":[24.363,138.181,670.21],"end":[26.827,189.69,578.91]},
+    "6522330-2":{"start":[18.318,100.344,699.93],"end":[10.531,160.681,627.18]},
+    "6539259-1":{"start":[11.436,169.944,292.09],"end":[14.276,211.446,212.89]},
+    "6539259-2":{"start":[22.28,5.108,1827.0],"end":[28.284,54.975,1753.2]},
+    "6556479-1":{"start":[14.038,110.933,601.57],"end":[54.882,194.295,575.17]},
+    "6556479-2":{"start":[-3.141,-228.636,-935.4],"end":[11.885,-126.981,-1004.4]},
+    "6617142-1":{"start":[4.641,139.034,291.09],"end":[14.783,204.205,237.74]},
+    "6617142-2":{"start":[10.712,131.78,691.77],"end":[30.34,199.79,638.673]},
+    "6630950-1":{"start":[55.106,150.274,590.32],"end":[81.054,210.221,553.87]},
+    "6630950-2":{"start":[22.126,124.03,566.96],"end":[46.088,196.089,523.76]},
+    "6634138-1":{"start":[-6.27,132.781,685.95],"end":[15.923,195.075,640.3]},
+    "6634138-2":{"start":[8.842,145.203,364.0],"end":[35.154,212.142,318.1]},
+    "6636725-1":{"start":[32.558,130.432,638.7],"end":[34.583,184.213,554.7]},
+    "6636725-2":{"start":[23.835,114.281,612.35],"end":[38.265,181.732,545.75]},
+}
+
+def run_batch(data_root, xlsx_path, workers=4, annotations=None):
+    datasets = discover_datasets(data_root)
+    annotations = annotations or {}
+    args_list = [(cid, ddir, xlsx_path, annotations.get(cid))
+                 for cid, ddir in datasets]
+    results = []
+    logger.info("  Batch: %d datasets, %d workers", len(args_list), workers)
+    if workers == 1:
+        for a in args_list:
+            results.append(process_patient(a))
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(process_patient, a): a[0] for a in args_list}
+            for f in as_completed(futs):
+                try: results.append(f.result())
+                except Exception as e: logger.error("  %s: %s", futs[f], e)
+
+    ok = sum(1 for r in results if r.get("status")=="OK")
+    wr = sum(1 for r in results if "WARN" in str(r.get("status","")))
+    er = sum(1 for r in results if "ERROR" in str(r.get("status","")))
+    logger.info("\n  ════ BATCH COMPLETE ════  Total=%d OK=%d WARN=%d ERROR=%d", len(results),ok,wr,er)
+    for label, key in [("start", "start_err"), ("end", "end_err")]:
+        vals = [r[key] for r in results if r.get(key) is not None]
+        if vals:
+            logger.info("  Mean %s error: %.2f mm (n=%d)", label, np.mean(vals), len(vals))
+    return results
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+def main():
+    p = argparse.ArgumentParser(description="Ring-shape stent detection v2 (nnU-Net + 3D tracking)",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--data_root", required=True)
+    p.add_argument("--output", default="stent_ring_results_v2.xlsx")
+    p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--annotations", default=None)
+    p.add_argument("--use_builtin_annotations", action="store_true")
+    p.add_argument("--sequential", action="store_true")
+    args = p.parse_args()
+
+    workers = 1 if args.sequential else (args.workers or max(1, os.cpu_count() or 4))
+    annots = {}
+    if args.use_builtin_annotations:
+        annots.update(BUILTIN_ANNOTATIONS)
+    if args.annotations:
+        annots.update(_load_annotations(args.annotations))
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+    logger.info("=" * 60)
+    logger.info("  Stent Ring Detector v2 (nnU-Net + 3D Cylindrical Tracking)")
+    logger.info("  data_root: %s", args.data_root)
+    logger.info("  output:    %s", args.output)
+    logger.info("  workers:   %d", workers)
+    logger.info("  TotalSeg:  %s", "AVAILABLE" if HAS_TOTALSEG else "not found (using threshold fallback)")
+    logger.info("  OpenCV:    %s", "yes" if HAS_CV2 else "no (using skimage)")
+    logger.info("=" * 60)
+    run_batch(args.data_root, args.output, workers, annots)
+    logger.info("Results: %s", args.output)
+
+if __name__ == "__main__":
+    main()
