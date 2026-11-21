@@ -1,0 +1,23 @@
+# Build / packaging artifacts (PyInstaller)
+/build/
+/dist/
+
+# Pipeline run outputs - large, regenerated per case, not source
+/output/
+
+# Patient DICOM data - must never be committed (PHI)
+*.dcm
+/5119278-1/
+
+# Generated exports left at the app root by the viewer
+/stent_endpoints.csv
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Lint cache
+/pylint/
+
+# Local Claude Code tool state (machine/session-specific, not project config)
+/.claude/
