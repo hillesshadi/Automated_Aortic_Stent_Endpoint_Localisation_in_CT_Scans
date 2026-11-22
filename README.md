@@ -46,3 +46,5 @@ Start/End/Midpoint coordinates (X, Y, Z in mm)
 Stent length, detected slices count, mean ring score
 Segmentation method used, validation errors (if available)
 Processing status (OK/WARNING/ERROR)
+![3D Aortic Centerline & Stent Render](aorta_centerline_render.png)
+![2D / 3D Viewer Interface](gui_3d_viewer.png)
